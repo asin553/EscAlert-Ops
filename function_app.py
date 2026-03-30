@@ -45,9 +45,9 @@ class Settings:
 
     smtp_host: str = os.getenv("SMTP_HOST", "smtp.outlook.com")
     smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
-    smtp_username: str = os.getenv("SMTP_USERNAME", "applications@thinkartha.com")
-    smtp_password: str = os.getenv("SMTP_PASSWORD", "ARTHA@2022")
-    smtp_sender: str = os.getenv("SMTP_SENDER", "applications@thinkartha.com")
+    smtp_username: str = os.getenv("SMTP_USERNAME", "ayush.singh@thinkartha.com")
+    smtp_password: str = os.getenv("SMTP_PASSWORD", "bwggnlzkwcdvdsgw")
+    smtp_sender: str = os.getenv("SMTP_SENDER", "ayush.singh@thinkartha.com")
     smtp_use_tls: bool = _env_bool("SMTP_USE_TLS", True)
 
     @property
@@ -158,6 +158,7 @@ TRANSIENT_PATTERNS = [
     r"service unavailable",
     r"max_deployment_attempts_reached",
     r"remote_engine_unavailable",
+    r"execution_terminated"
 ]
 
 NON_RETRIABLE_PATTERNS = [
@@ -279,7 +280,7 @@ def should_suppress_duplicate(task_state: Dict[str, Any], signature: str, now: d
     return age_minutes < suppress_min
 
 
-@app.timer_trigger(schedule="0 */5 * * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False)
+@app.timer_trigger(schedule="0 */30 * * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False)
 def timer_trigger(myTimer: func.TimerRequest) -> None:
     if myTimer.past_due:
         logging.info("The timer is past due.")
