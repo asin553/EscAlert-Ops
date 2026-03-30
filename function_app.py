@@ -22,8 +22,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 @dataclass
 class Settings:
     talend_region: str = os.getenv("TALEND_REGION", "us").lower()
-    talend_pat: str = os.getenv("TALEND_PAT", "")
-    lookback_limit: int = int(os.getenv("TALEND_TASK_EXECUTIONS_LIMIT", "200"))
+    talend_pat: str = os.getenv("TALEND_PAT", "KeJ_eYY2RsKX4Df-hNhgOi97eBQ8TfOsIABiCZz2Ci5kUMbzz1SKruUkHjtdkhhl")
+    lookback_limit: int = int(os.getenv("TALEND_TASK_EXECUTIONS_LIMIT", "100"))
     alert_recipients_file: str = os.getenv("ALERT_RECIPIENTS_FILE", "alert_recipients.json")
     state_file: str = os.getenv("ANS_STATE_FILE", "/tmp/ans_state.json")
     duplicate_suppress_minutes: int = int(os.getenv("DUPLICATE_SUPPRESS_MINUTES", "120"))
@@ -43,11 +43,11 @@ class Settings:
         "/processing/executions",
     )
 
-    smtp_host: str = os.getenv("SMTP_HOST", "")
+    smtp_host: str = os.getenv("SMTP_HOST", "smtp.outlook.com")
     smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
-    smtp_username: str = os.getenv("SMTP_USERNAME", "")
-    smtp_password: str = os.getenv("SMTP_PASSWORD", "")
-    smtp_sender: str = os.getenv("SMTP_SENDER", "")
+    smtp_username: str = os.getenv("SMTP_USERNAME", "applications@thinkartha.com")
+    smtp_password: str = os.getenv("SMTP_PASSWORD", "ARTHA@2022")
+    smtp_sender: str = os.getenv("SMTP_SENDER", "applications@thinkartha.com")
     smtp_use_tls: bool = _env_bool("SMTP_USE_TLS", True)
 
     @property
