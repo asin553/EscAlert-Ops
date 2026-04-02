@@ -37,6 +37,8 @@ class Settings:
 
     retry_enabled: bool = _env_bool("RETRY_ENABLED", True)
     retry_max_attempts: int = int(os.getenv("RETRY_MAX_ATTEMPTS", "1"))
+    plan_retry_enabled: bool = _env_bool("PLAN_RETRY_ENABLED", True)
+    plan_retry_max_attempts: int = int(os.getenv("PLAN_RETRY_MAX_ATTEMPTS", "1"))
 
     smtp_host: str = os.getenv("SMTP_HOST", "")
     smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
@@ -56,6 +58,10 @@ class Settings:
     retry_execution_endpoint: str = os.getenv(
         "RETRY_EXECUTION_ENDPOINT",
         "/processing/executions",
+    )
+    plan_retry_execution_endpoint: str = os.getenv(
+        "PLAN_RETRY_EXECUTION_ENDPOINT",
+        "/processing/executions/plans",
     )
     plan_executions_endpoint: str = os.getenv(
         "PLAN_EXECUTIONS_ENDPOINT",
@@ -114,6 +120,16 @@ class TalendClient:
         payload = {"executable": task_id, "logLevel": "WARN"}
         resp = self.session.post(
             self._url(self.settings.retry_execution_endpoint),
+            data=json.dumps(payload),
+            timeout=self.settings.request_timeout_seconds,
+        )
+        resp.raise_for_status()
+        return resp.json().get("executionId")
+
+    def retry_plan(self, plan_executable_id: str) -> Optional[str]:
+        payload = {"executable": plan_executable_id}
+        resp = self.session.post(
+            self._url(self.settings.plan_retry_execution_endpoint),
             data=json.dumps(payload),
             timeout=self.settings.request_timeout_seconds,
         )
@@ -547,6 +563,7 @@ def enrich_plan_context(
 
     plan_definition = client.get_plan_definition(plan_id)
     plan_name = plan_definition.get("name", plan_id)
+    plan_executable = plan_definition.get("executable", plan_id)
     chart = plan_definition.get("chart", {})
     ordered_steps = flatten_plan_steps(chart)
     step_name_map = {s["id"]: s.get("name", s["id"]) for s in ordered_steps}
@@ -565,6 +582,7 @@ def enrich_plan_context(
         "plan_id": plan_id,
         "plan_execution_id": plan_execution_id or "",
         "plan_name": plan_name,
+        "plan_executable": plan_executable,
         "failed_step_id": failed_step_id,
         "failed_step_name": failed_step_name,
         "downstream_summary": ", ".join(downstream) if downstream else "",
@@ -652,36 +670,60 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
         if store.exists_alert_key(alert_key):
             continue
 
-        component_payload = client.get_component_metrics(execution_id)
-        decision, reason = classify_failure(execution, component_payload)
-
-        # Retry only for transient MANUAL task runs.
-        if (
-            execution.get("executionType") == "MANUAL"
-            and decision == "retryable_noise"
-            and settings.retry_enabled
-        ):
-            retry_count = 0
-            while retry_count < settings.retry_max_attempts:
-                retry_count += 1
-                try:
-                    new_execution_id = client.retry_task(task_id)
-                    logging.info(
-                        "Retried task %s due to transient issue. prior=%s new=%s",
-                        task_id,
-                        execution_id,
-                        new_execution_id,
-                    )
-                    break
-                except Exception:
-                    logging.exception("Retry attempt %d failed for task %s", retry_count, task_id)
-
         plan_context: Dict[str, str] = {}
         if execution.get("executionType") == "PLAN" and execution.get("planId"):
             try:
                 plan_context = enrich_plan_context(client, execution)
             except Exception:
                 logging.exception("Failed to enrich plan context for execution %s", execution_id)
+
+        component_payload = client.get_component_metrics(execution_id)
+        decision, reason = classify_failure(execution, component_payload)
+
+        if decision == "retryable_noise":
+            # Retry transient MANUAL task runs.
+            if execution.get("executionType") == "MANUAL" and settings.retry_enabled:
+                retry_count = 0
+                while retry_count < settings.retry_max_attempts:
+                    retry_count += 1
+                    try:
+                        new_execution_id = client.retry_task(task_id)
+                        logging.info(
+                            "Retried task %s due to transient issue. prior=%s new=%s",
+                            task_id,
+                            execution_id,
+                            new_execution_id,
+                        )
+                        break
+                    except Exception:
+                        logging.exception("Retry attempt %d failed for task %s", retry_count, task_id)
+
+            # Retry transient PLAN runs via /processing/executions/plans.
+            if execution.get("executionType") == "PLAN" and settings.plan_retry_enabled:
+                plan_exec_id = (
+                    plan_context.get("plan_executable")
+                    or execution.get("planId")
+                    or plan_context.get("plan_id")
+                )
+                if plan_exec_id:
+                    retry_count = 0
+                    while retry_count < settings.plan_retry_max_attempts:
+                        retry_count += 1
+                        try:
+                            new_plan_execution_id = client.retry_plan(plan_exec_id)
+                            logging.info(
+                                "Retried plan executable %s due to transient issue. prior=%s new=%s",
+                                plan_exec_id,
+                                execution_id,
+                                new_plan_execution_id,
+                            )
+                            break
+                        except Exception:
+                            logging.exception(
+                                "Plan retry attempt %d failed for plan executable %s",
+                                retry_count,
+                                plan_exec_id,
+                            )
 
         master_summary = parse_master_job_dependency(component_payload)
         human_error = summarize_error(execution.get("errorMessage", ""), component_payload)
