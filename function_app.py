@@ -27,8 +27,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 class Settings:
     talend_region: str = os.getenv("TALEND_REGION", "us").lower()
     talend_pat: str = os.getenv("TALEND_PAT", "")
-    lookback_limit: int = int(os.getenv("TALEND_TASK_EXECUTIONS_LIMIT", "200"))
-    plan_lookback_limit: int = int(os.getenv("TALEND_PLAN_EXECUTIONS_LIMIT", "200"))
+    lookback_limit: int = int(os.getenv("TALEND_TASK_EXECUTIONS_LIMIT", "100"))
+    plan_lookback_limit: int = int(os.getenv("TALEND_PLAN_EXECUTIONS_LIMIT", "100"))
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
 
     alert_recipients_file: str = os.getenv("ALERT_RECIPIENTS_FILE", "alert_recipients.json")
@@ -506,6 +506,7 @@ TRANSIENT_PATTERNS = [
     r"service unavailable",
     r"max_deployment_attempts_reached",
     r"remote_engine_unavailable",
+    r"execution_terminated"
 ]
 NON_RETRIABLE_PATTERNS = [
     r"exception in component",
@@ -513,6 +514,8 @@ NON_RETRIABLE_PATTERNS = [
     r"already exist",
     r"file has more records",
     r"permission denied",
+    r"syntax",
+    r"nullpointerexception",
 ]
 
 
@@ -815,7 +818,7 @@ def build_digest_html(digest_day: date, rows: List[Dict[str, Any]]) -> str:
 # ----------------------------
 # Trigger 1: Frequent polling/ingestion
 # ----------------------------
-@app.timer_trigger(schedule="%POLL_SCHEDULE%", arg_name="pollTimer", run_on_startup=False, use_monitor=True)
+@app.timer_trigger(schedule="0 */10 * * * *", arg_name="pollTimer", run_on_startup=False, use_monitor=True)
 def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
     if pollTimer.past_due:
         logging.info("Poll timer is past due.")
@@ -941,7 +944,7 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
 # ----------------------------
 # Trigger 2: Daily summary email
 # ----------------------------
-@app.timer_trigger(schedule="%DIGEST_SCHEDULE%", arg_name="digestTimer", run_on_startup=False, use_monitor=True)
+@app.timer_trigger(schedule="0 */5 * * * *", arg_name="digestTimer", run_on_startup=False, use_monitor=True)
 def send_daily_digest(digestTimer: func.TimerRequest) -> None:
     if digestTimer.past_due:
         logging.info("Digest timer is past due.")
