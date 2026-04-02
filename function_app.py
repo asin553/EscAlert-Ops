@@ -47,6 +47,15 @@ class Settings:
     smtp_sender: str = os.getenv("SMTP_SENDER", "")
     smtp_use_tls: bool = _env_bool("SMTP_USE_TLS", True)
 
+    ai_summarization_enabled: bool = _env_bool("AI_SUMMARIZATION_ENABLED", False)
+    ai_summarization_mode: str = os.getenv("AI_SUMMARIZATION_MODE", "fallback").lower()  # fallback|always
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    openai_api_base_url: str = os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com/v1")
+    openai_chat_endpoint: str = os.getenv("OPENAI_CHAT_ENDPOINT", "/chat/completions")
+    openai_timeout_seconds: int = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
+    ai_input_char_limit: int = int(os.getenv("AI_INPUT_CHAR_LIMIT", "3500"))
+
     task_executions_endpoint: str = os.getenv(
         "TASK_EXECUTIONS_ENDPOINT",
         "/processing/executables/tasks/executions",
@@ -395,6 +404,71 @@ class EmailNotifier:
             server.sendmail(self.settings.smtp_sender, self.recipients, msg.as_string())
 
 
+class OpenAIErrorSummarizer:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def is_enabled(self) -> bool:
+        return self.settings.ai_summarization_enabled and bool(self.settings.openai_api_key)
+
+    def summarize(
+        self,
+        error_message: str,
+        component_payload: Dict[str, Any],
+        execution: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        if not self.is_enabled():
+            return None
+
+        stacktraces = [
+            m.get("stacktrace", "") for m in component_payload.get("metrics", {}).get("items", []) if m.get("stacktrace")
+        ]
+        context = {
+            "execution_status": (execution or {}).get("executionStatus", ""),
+            "execution_type": (execution or {}).get("executionType", ""),
+            "error_message": (error_message or "")[: self.settings.ai_input_char_limit],
+            "stacktrace_excerpt": "\n".join(stacktraces)[: self.settings.ai_input_char_limit],
+        }
+
+        system_prompt = (
+            "You are an incident assistant for Talend operations. "
+            "Return concise, plain-English summaries for monitoring teams. "
+            "Avoid internal IDs, Java traces, and Talend component jargon unless unavoidable."
+        )
+        user_prompt = (
+            "Summarize this failure in one short sentence, understandable by non-developers. "
+            "Return strict JSON with key: summary.\n\n"
+            f"Context:\n{json.dumps(context)}"
+        )
+
+        try:
+            resp = requests.post(
+                f"{self.settings.openai_api_base_url}{self.settings.openai_chat_endpoint}",
+                headers={
+                    "Authorization": f"Bearer {self.settings.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.settings.openai_model,
+                    "temperature": 0.1,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                },
+                timeout=self.settings.openai_timeout_seconds,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            parsed = json.loads(content) if isinstance(content, str) else content
+            summary = str(parsed.get("summary", "")).strip()
+            return summary[:300] if summary else None
+        except Exception:
+            logging.exception("OpenAI summarization failed; using rule-based fallback.")
+            return None
+
+
 # ----------------------------
 # Decisioning helpers
 # ----------------------------
@@ -456,7 +530,10 @@ def _contains_pattern(text: str, patterns: List[str]) -> bool:
     return any(re.search(pattern, lowered) for pattern in patterns)
 
 
-def summarize_error(error_message: str, component_payload: Dict[str, Any]) -> str:
+GENERIC_SUMMARY = "Job failed due to processing error; manual review recommended."
+
+
+def summarize_error_rule_based(error_message: str, component_payload: Dict[str, Any]) -> str:
     combined = (error_message or "") + "\n" + "\n".join(
         [m.get("stacktrace", "") for m in component_payload.get("metrics", {}).get("items", [])]
     )
@@ -474,7 +551,25 @@ def summarize_error(error_message: str, component_payload: Dict[str, Any]) -> st
         return "A child job failed inside the master job chain."
     if "permission denied" in text:
         return "Permission issue while accessing resource."
-    return "Job failed due to processing error; manual review recommended."
+    return GENERIC_SUMMARY
+
+
+def summarize_error(
+    error_message: str,
+    component_payload: Dict[str, Any],
+    execution: Optional[Dict[str, Any]] = None,
+    ai_summarizer: Optional[OpenAIErrorSummarizer] = None,
+    ai_mode: str = "fallback",
+) -> str:
+    baseline = summarize_error_rule_based(error_message, component_payload)
+    if not ai_summarizer or not ai_summarizer.is_enabled():
+        return baseline
+
+    if ai_mode != "always" and baseline != GENERIC_SUMMARY:
+        return baseline
+
+    ai_summary = ai_summarizer.summarize(error_message, component_payload, execution)
+    return ai_summary or baseline
 
 
 def classify_failure(execution: Dict[str, Any], component_payload: Dict[str, Any]) -> Tuple[str, str]:
@@ -651,6 +746,7 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
     settings = Settings()
     store = pick_store(settings)
     store.init()
+    ai_summarizer = OpenAIErrorSummarizer(settings)
 
     client = TalendClient(settings)
     all_execs = client.get_task_executions()
@@ -726,7 +822,13 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
                             )
 
         master_summary = parse_master_job_dependency(component_payload)
-        human_error = summarize_error(execution.get("errorMessage", ""), component_payload)
+        human_error = summarize_error(
+            execution.get("errorMessage", ""),
+            component_payload,
+            execution=execution,
+            ai_summarizer=ai_summarizer,
+            ai_mode=settings.ai_summarization_mode,
+        )
 
         row = {
             "alert_key": alert_key,
