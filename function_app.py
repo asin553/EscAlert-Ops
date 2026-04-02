@@ -56,6 +56,7 @@ class Settings:
     openai_chat_endpoint: str = os.getenv("OPENAI_CHAT_ENDPOINT", "/chat/completions")
     openai_timeout_seconds: int = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
     ai_input_char_limit: int = int(os.getenv("AI_INPUT_CHAR_LIMIT", "3500"))
+    digest_day_offset_days: int = int(os.getenv("DIGEST_DAY_OFFSET_DAYS", "0"))
 
     task_executions_endpoint: str = os.getenv(
         "TASK_EXECUTIONS_ENDPOINT",
@@ -957,7 +958,7 @@ def send_daily_digest(digestTimer: func.TimerRequest) -> None:
         logging.warning("Email notifier not configured. Digest skipped.")
         return
 
-    digest_day = datetime.now(timezone.utc).date() - timedelta(days=1)
+    digest_day = datetime.now(timezone.utc).date() - timedelta(days=settings.digest_day_offset_days)
     rows = store.get_digest_rows(digest_day)
     body = build_digest_html(digest_day, rows)
     subject = f"Talend Daily Alert Summary - {digest_day.isoformat()}"
