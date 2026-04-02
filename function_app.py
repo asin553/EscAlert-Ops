@@ -3,8 +3,9 @@ import logging
 import os
 import re
 import smtplib
+import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -15,6 +16,9 @@ import requests
 app = func.FunctionApp()
 
 
+# ----------------------------
+# Configuration
+# ----------------------------
 def _env_bool(name: str, default: bool = False) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -22,14 +26,25 @@ def _env_bool(name: str, default: bool = False) -> bool:
 @dataclass
 class Settings:
     talend_region: str = os.getenv("TALEND_REGION", "us").lower()
-    talend_pat: str = os.getenv("TALEND_PAT", "KeJ_eYY2RsKX4Df-hNhgOi97eBQ8TfOsIABiCZz2Ci5kUMbzz1SKruUkHjtdkhhl")
-    lookback_limit: int = int(os.getenv("TALEND_TASK_EXECUTIONS_LIMIT", "100"))
+    talend_pat: str = os.getenv("TALEND_PAT", "")
+    lookback_limit: int = int(os.getenv("TALEND_TASK_EXECUTIONS_LIMIT", "200"))
+    plan_lookback_limit: int = int(os.getenv("TALEND_PLAN_EXECUTIONS_LIMIT", "200"))
+    request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
+
     alert_recipients_file: str = os.getenv("ALERT_RECIPIENTS_FILE", "alert_recipients.json")
-    state_file: str = os.getenv("ANS_STATE_FILE", "/tmp/ans_state.json")
-    duplicate_suppress_minutes: int = int(os.getenv("DUPLICATE_SUPPRESS_MINUTES", "120"))
+    local_db_path: str = os.getenv("LOCAL_ALERT_DB", "/tmp/ans_alerts.db")
+    azure_sql_connection_string: str = os.getenv("AZURE_SQL_CONNECTION_STRING", "")
+
     retry_enabled: bool = _env_bool("RETRY_ENABLED", True)
     retry_max_attempts: int = int(os.getenv("RETRY_MAX_ATTEMPTS", "1"))
-    request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
+
+    smtp_host: str = os.getenv("SMTP_HOST", "")
+    smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
+    smtp_username: str = os.getenv("SMTP_USERNAME", "")
+    smtp_password: str = os.getenv("SMTP_PASSWORD", "")
+    smtp_sender: str = os.getenv("SMTP_SENDER", "")
+    smtp_use_tls: bool = _env_bool("SMTP_USE_TLS", True)
+
     task_executions_endpoint: str = os.getenv(
         "TASK_EXECUTIONS_ENDPOINT",
         "/processing/executables/tasks/executions",
@@ -42,19 +57,27 @@ class Settings:
         "RETRY_EXECUTION_ENDPOINT",
         "/processing/executions",
     )
-
-    smtp_host: str = os.getenv("SMTP_HOST", "smtp.outlook.com")
-    smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
-    smtp_username: str = os.getenv("SMTP_USERNAME", "ayush.singh@thinkartha.com")
-    smtp_password: str = os.getenv("SMTP_PASSWORD", "bwggnlzkwcdvdsgw")
-    smtp_sender: str = os.getenv("SMTP_SENDER", "ayush.singh@thinkartha.com")
-    smtp_use_tls: bool = _env_bool("SMTP_USE_TLS", True)
+    plan_executions_endpoint: str = os.getenv(
+        "PLAN_EXECUTIONS_ENDPOINT",
+        "/processing/executables/plans/executions",
+    )
+    plan_steps_endpoint_template: str = os.getenv(
+        "PLAN_STEPS_ENDPOINT_TEMPLATE",
+        "/processing/executions/plans/{plan_execution_id}/steps",
+    )
+    plan_definition_endpoint_template: str = os.getenv(
+        "PLAN_DEFINITION_ENDPOINT_TEMPLATE",
+        "/orchestration/executables/plans/{plan_id}",
+    )
 
     @property
     def api_base_url(self) -> str:
         return f"https://api.{self.talend_region}.cloud.talend.com"
 
 
+# ----------------------------
+# Talend API client
+# ----------------------------
 class TalendClient:
     def __init__(self, settings: Settings) -> None:
         if not settings.talend_pat:
@@ -97,25 +120,234 @@ class TalendClient:
         resp.raise_for_status()
         return resp.json().get("executionId")
 
+    def get_plan_executions(self) -> List[Dict[str, Any]]:
+        params = {"limit": self.settings.plan_lookback_limit, "offset": 0}
+        resp = self.session.get(
+            self._url(self.settings.plan_executions_endpoint),
+            params=params,
+            timeout=self.settings.request_timeout_seconds,
+        )
+        resp.raise_for_status()
+        return resp.json().get("items", [])
 
-class StateStore:
-    def __init__(self, path: str) -> None:
-        self.path = Path(path)
+    def get_plan_steps(self, plan_execution_id: str) -> List[Dict[str, Any]]:
+        endpoint = self.settings.plan_steps_endpoint_template.format(plan_execution_id=plan_execution_id)
+        resp = self.session.get(self._url(endpoint), timeout=self.settings.request_timeout_seconds)
+        resp.raise_for_status()
+        return resp.json() if isinstance(resp.json(), list) else []
 
-    def load(self) -> Dict[str, Any]:
-        if not self.path.exists():
-            return {"tasks": {}}
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            logging.warning("State file is invalid JSON. Reinitializing state.")
-            return {"tasks": {}}
-
-    def save(self, state: Dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    def get_plan_definition(self, plan_id: str) -> Dict[str, Any]:
+        endpoint = self.settings.plan_definition_endpoint_template.format(plan_id=plan_id)
+        resp = self.session.get(self._url(endpoint), timeout=self.settings.request_timeout_seconds)
+        resp.raise_for_status()
+        return resp.json()
 
 
+# ----------------------------
+# Storage: Azure SQL (optional) + SQLite fallback
+# ----------------------------
+class AlertStore:
+    def init(self) -> None:
+        raise NotImplementedError
+
+    def exists_alert_key(self, alert_key: str) -> bool:
+        raise NotImplementedError
+
+    def insert_alert(self, row: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def get_digest_rows(self, digest_day: date) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def mark_emailed(self, ids: List[int]) -> None:
+        raise NotImplementedError
+
+
+class SqliteAlertStore(AlertStore):
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+
+    def _conn(self) -> sqlite3.Connection:
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init(self) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_key TEXT UNIQUE NOT NULL,
+                    observed_at_utc TEXT NOT NULL,
+                    day_utc TEXT NOT NULL,
+                    execution_id TEXT NOT NULL,
+                    task_id TEXT,
+                    execution_type TEXT,
+                    execution_status TEXT,
+                    plan_id TEXT,
+                    plan_execution_id TEXT,
+                    plan_name TEXT,
+                    failed_step_id TEXT,
+                    failed_step_name TEXT,
+                    downstream_summary TEXT,
+                    master_summary TEXT,
+                    decision TEXT,
+                    human_error TEXT,
+                    raw_error TEXT,
+                    email_sent INTEGER DEFAULT 0,
+                    email_sent_at_utc TEXT
+                )
+                """
+            )
+
+    def exists_alert_key(self, alert_key: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute("SELECT 1 FROM alerts WHERE alert_key = ?", (alert_key,)).fetchone()
+            return row is not None
+
+    def insert_alert(self, row: Dict[str, Any]) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO alerts (
+                    alert_key, observed_at_utc, day_utc, execution_id, task_id, execution_type, execution_status,
+                    plan_id, plan_execution_id, plan_name, failed_step_id, failed_step_name,
+                    downstream_summary, master_summary, decision, human_error, raw_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["alert_key"],
+                    row["observed_at_utc"],
+                    row["day_utc"],
+                    row["execution_id"],
+                    row.get("task_id"),
+                    row.get("execution_type"),
+                    row.get("execution_status"),
+                    row.get("plan_id"),
+                    row.get("plan_execution_id"),
+                    row.get("plan_name"),
+                    row.get("failed_step_id"),
+                    row.get("failed_step_name"),
+                    row.get("downstream_summary"),
+                    row.get("master_summary"),
+                    row.get("decision"),
+                    row.get("human_error"),
+                    row.get("raw_error"),
+                ),
+            )
+
+    def get_digest_rows(self, digest_day: date) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM alerts
+                WHERE day_utc = ? AND email_sent = 0
+                ORDER BY observed_at_utc ASC
+                """,
+                (digest_day.isoformat(),),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_emailed(self, ids: List[int]) -> None:
+        if not ids:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        placeholders = ",".join("?" for _ in ids)
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE alerts SET email_sent = 1, email_sent_at_utc = ? WHERE id IN ({placeholders})",
+                (now, *ids),
+            )
+
+
+class AzureSqlAlertStore(AlertStore):
+    """Optional Azure SQL backend. Activated when AZURE_SQL_CONNECTION_STRING is set."""
+
+    def __init__(self, conn_str: str) -> None:
+        self.conn_str = conn_str
+
+    def _conn(self):
+        import pyodbc  # Lazy import so local dev works without pyodbc.
+
+        return pyodbc.connect(self.conn_str)
+
+    def init(self) -> None:
+        # Keep schema in sync with SqliteAlertStore; using SQL Server syntax.
+        ddl = """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='alerts' AND xtype='U')
+        CREATE TABLE alerts (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            alert_key NVARCHAR(255) UNIQUE NOT NULL,
+            observed_at_utc NVARCHAR(64) NOT NULL,
+            day_utc NVARCHAR(32) NOT NULL,
+            execution_id NVARCHAR(128) NOT NULL,
+            task_id NVARCHAR(128),
+            execution_type NVARCHAR(64),
+            execution_status NVARCHAR(64),
+            plan_id NVARCHAR(128),
+            plan_execution_id NVARCHAR(128),
+            plan_name NVARCHAR(256),
+            failed_step_id NVARCHAR(128),
+            failed_step_name NVARCHAR(256),
+            downstream_summary NVARCHAR(MAX),
+            master_summary NVARCHAR(MAX),
+            decision NVARCHAR(64),
+            human_error NVARCHAR(512),
+            raw_error NVARCHAR(MAX),
+            email_sent BIT DEFAULT 0,
+            email_sent_at_utc NVARCHAR(64)
+        )
+        """
+        with self._conn() as conn:
+            conn.cursor().execute(ddl)
+            conn.commit()
+
+    def exists_alert_key(self, alert_key: str) -> bool:
+        with self._conn() as conn:
+            row = conn.cursor().execute("SELECT TOP 1 1 FROM alerts WHERE alert_key = ?", alert_key).fetchone()
+            return row is not None
+
+    def insert_alert(self, row: Dict[str, Any]) -> None:
+        fields = [
+            "alert_key", "observed_at_utc", "day_utc", "execution_id", "task_id", "execution_type",
+            "execution_status", "plan_id", "plan_execution_id", "plan_name", "failed_step_id",
+            "failed_step_name", "downstream_summary", "master_summary", "decision", "human_error",
+            "raw_error",
+        ]
+        values = [row.get(f) for f in fields]
+        placeholders = ",".join("?" for _ in values)
+        sql = f"INSERT INTO alerts ({','.join(fields)}) VALUES ({placeholders})"
+        with self._conn() as conn:
+            conn.cursor().execute(sql, values)
+            conn.commit()
+
+    def get_digest_rows(self, digest_day: date) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            cur = conn.cursor()
+            rows = cur.execute(
+                "SELECT * FROM alerts WHERE day_utc = ? AND email_sent = 0 ORDER BY observed_at_utc ASC",
+                digest_day.isoformat(),
+            ).fetchall()
+            columns = [c[0] for c in cur.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def mark_emailed(self, ids: List[int]) -> None:
+        if not ids:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            cur = conn.cursor()
+            for id_ in ids:
+                cur.execute("UPDATE alerts SET email_sent = 1, email_sent_at_utc = ? WHERE id = ?", now, id_)
+            conn.commit()
+
+
+# ----------------------------
+# Email notifier
+# ----------------------------
 class EmailNotifier:
     def __init__(self, settings: Settings, recipients: List[str]) -> None:
         self.settings = settings
@@ -135,7 +367,7 @@ class EmailNotifier:
             logging.warning("SMTP settings or recipients are missing; skipping email notification.")
             return
 
-        msg = MIMEText(body)
+        msg = MIMEText(body, "html")
         msg["Subject"] = subject
         msg["From"] = self.settings.smtp_sender
         msg["To"] = ", ".join(self.recipients)
@@ -147,6 +379,10 @@ class EmailNotifier:
             server.sendmail(self.settings.smtp_sender, self.recipients, msg.as_string())
 
 
+# ----------------------------
+# Decisioning helpers
+# ----------------------------
+FAILED_STATES = {"EXECUTION_FAILED", "DEPLOY_FAILED", "EXECUTION_TERMINATED", "EXECUTION_REJECTED"}
 TRANSIENT_PATTERNS = [
     r"remote engine is not available",
     r"no available cloud engines",
@@ -158,25 +394,14 @@ TRANSIENT_PATTERNS = [
     r"service unavailable",
     r"max_deployment_attempts_reached",
     r"remote_engine_unavailable",
-    r"execution_terminated"
 ]
-
 NON_RETRIABLE_PATTERNS = [
     r"exception in component",
     r"tdieexception",
     r"already exist",
     r"file has more records",
-    r"syntax",
     r"permission denied",
-    r"nullpointerexception",
 ]
-
-FAILED_STATES = {
-    "EXECUTION_FAILED",
-    "DEPLOY_FAILED",
-    "EXECUTION_TERMINATED",
-    "EXECUTION_REJECTED",
-}
 
 
 def _parse_dt(value: Optional[str]) -> datetime:
@@ -196,46 +421,154 @@ def get_latest_execution_by_task(items: Iterable[Dict[str, Any]]) -> Dict[str, D
             _parse_dt(item.get("startTimestamp")),
             _parse_dt(item.get("triggerTimestamp")),
         )
-        candidate = grouped.get(task_id)
-        if not candidate:
+        current = grouped.get(task_id)
+        if not current:
             grouped[task_id] = item
             continue
-        existing_score = max(
-            _parse_dt(candidate.get("finishTimestamp")),
-            _parse_dt(candidate.get("startTimestamp")),
-            _parse_dt(candidate.get("triggerTimestamp")),
+        current_score = max(
+            _parse_dt(current.get("finishTimestamp")),
+            _parse_dt(current.get("startTimestamp")),
+            _parse_dt(current.get("triggerTimestamp")),
         )
-        if score > existing_score:
+        if score > current_score:
             grouped[task_id] = item
     return grouped
 
 
 def _contains_pattern(text: str, patterns: List[str]) -> bool:
-    lowered = text.lower()
+    lowered = (text or "").lower()
     return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def summarize_error(error_message: str, component_payload: Dict[str, Any]) -> str:
+    combined = (error_message or "") + "\n" + "\n".join(
+        [m.get("stacktrace", "") for m in component_payload.get("metrics", {}).get("items", [])]
+    )
+    text = combined.lower()
+
+    if "file has more records" in text:
+        return "Input file exceeds expected record limit."
+    if "already exist" in text:
+        return "Output file already exists and overwrite is disabled."
+    if "remote engine" in text or "cloud engines" in text:
+        return "Talend runtime engine is unavailable."
+    if "connection" in text or "network" in text or "timeout" in text:
+        return "Temporary connectivity issue occurred."
+    if "child job running failed" in text:
+        return "A child job failed inside the master job chain."
+    if "permission denied" in text:
+        return "Permission issue while accessing resource."
+    return "Job failed due to processing error; manual review recommended."
 
 
 def classify_failure(execution: Dict[str, Any], component_payload: Dict[str, Any]) -> Tuple[str, str]:
     err = execution.get("errorMessage", "") or ""
     status = execution.get("executionStatus", "") or ""
-
-    stacktraces: List[str] = []
-    for item in component_payload.get("metrics", {}).get("items", []):
-        st = item.get("stacktrace")
-        if st:
-            stacktraces.append(st)
+    stacktraces = [m.get("stacktrace", "") for m in component_payload.get("metrics", {}).get("items", [])]
     combined = "\n".join([err, *stacktraces])
 
     if _contains_pattern(combined, NON_RETRIABLE_PATTERNS):
-        return "valid_failure", "Error pattern indicates code/data issue requiring human intervention."
-
+        return "valid_failure", "Likely job/data issue; human intervention needed."
     if status in {"DEPLOY_FAILED", "EXECUTION_REJECTED"} and _contains_pattern(combined, TRANSIENT_PATTERNS):
-        return "retryable_noise", "Deployment/execution failure appears transient; retry is safe."
-
+        return "retryable_noise", "Likely transient platform issue; retry allowed."
     if _contains_pattern(combined, TRANSIENT_PATTERNS):
-        return "retryable_noise", "Transient infrastructure/network issue detected from logs."
+        return "retryable_noise", "Likely temporary infrastructure/network issue."
+    return "valid_failure", "Failure reason is ambiguous; escalate to humans."
 
-    return "valid_failure", "Failure reason is ambiguous and should be escalated to humans."
+
+def parse_master_job_dependency(component_payload: Dict[str, Any]) -> str:
+    run_jobs = [
+        m for m in component_payload.get("metrics", {}).get("items", []) if m.get("connector_type") == "tRunJob"
+    ]
+    if not run_jobs:
+        return ""
+
+    def runjob_index(item: Dict[str, Any]) -> int:
+        connector_id = item.get("connector_id", "")
+        match = re.search(r"_(\d+)$", connector_id)
+        return int(match.group(1)) if match else 9999
+
+    ordered = sorted(run_jobs, key=runjob_index)
+    failed = next((j for j in ordered if j.get("stacktrace")), None)
+    if not failed:
+        names = [j.get("connector_label", j.get("connector_id", "unknown")) for j in ordered]
+        return f"Master job chain detected: {' -> '.join(names)}"
+
+    failed_idx = runjob_index(failed)
+    failed_name = failed.get("connector_label", failed.get("connector_id", "unknown"))
+    downstream = [
+        j.get("connector_label", j.get("connector_id", "unknown"))
+        for j in ordered
+        if runjob_index(j) > failed_idx
+    ]
+    if downstream:
+        return f"Master chain failure at '{failed_name}'; downstream not expected: {', '.join(downstream)}"
+    return f"Master chain failure at '{failed_name}'."
+
+
+def flatten_plan_steps(chart_node: Dict[str, Any]) -> List[Dict[str, Any]]:
+    steps: List[Dict[str, Any]] = []
+    current = chart_node
+    while isinstance(current, dict) and current:
+        step_id = current.get("id")
+        if step_id:
+            flows = current.get("flows", []) if isinstance(current.get("flows"), list) else []
+            flow_names = [f.get("name") for f in flows if isinstance(f, dict) and f.get("name")]
+            steps.append(
+                {
+                    "id": step_id,
+                    "name": current.get("name", step_id),
+                    "flows": flow_names,
+                }
+            )
+        current = current.get("nextStep") if isinstance(current.get("nextStep"), dict) else None
+    return steps
+
+
+def enrich_plan_context(
+    client: TalendClient,
+    execution: Dict[str, Any],
+) -> Dict[str, str]:
+    plan_id = execution.get("planId")
+    if not plan_id:
+        return {}
+
+    plan_executions = client.get_plan_executions()
+    matching = [p for p in plan_executions if p.get("planId") == plan_id]
+    if not matching:
+        return {"plan_id": plan_id}
+
+    matching.sort(key=lambda x: _parse_dt(x.get("startTimestamp")), reverse=True)
+    plan_exec = matching[0]
+    plan_execution_id = plan_exec.get("executionId")
+
+    step_rows = client.get_plan_steps(plan_execution_id) if plan_execution_id else []
+    failed_step = next((s for s in step_rows if str(s.get("executionStatus", "")).upper() in {"FAIL", "FAILED"}), None)
+
+    plan_definition = client.get_plan_definition(plan_id)
+    plan_name = plan_definition.get("name", plan_id)
+    chart = plan_definition.get("chart", {})
+    ordered_steps = flatten_plan_steps(chart)
+    step_name_map = {s["id"]: s.get("name", s["id"]) for s in ordered_steps}
+
+    failed_step_id = failed_step.get("id") if failed_step else ""
+    failed_step_name = step_name_map.get(failed_step_id, failed_step_id) if failed_step_id else ""
+
+    downstream: List[str] = []
+    if failed_step_id:
+        ids = [s["id"] for s in ordered_steps]
+        if failed_step_id in ids:
+            idx = ids.index(failed_step_id)
+            downstream = [step_name_map.get(step_id, step_id) for step_id in ids[idx + 1 :]]
+
+    return {
+        "plan_id": plan_id,
+        "plan_execution_id": plan_execution_id or "",
+        "plan_name": plan_name,
+        "failed_step_id": failed_step_id,
+        "failed_step_name": failed_step_name,
+        "downstream_summary": ", ".join(downstream) if downstream else "",
+    }
 
 
 def load_recipients(path: str) -> List[str]:
@@ -247,53 +580,61 @@ def load_recipients(path: str) -> List[str]:
     return [r for r in data.get("emails", []) if isinstance(r, str) and r.strip()]
 
 
-def compose_alert(execution: Dict[str, Any], reason: str, component_payload: Dict[str, Any]) -> Tuple[str, str]:
-    task_id = execution.get("taskId")
-    execution_id = execution.get("executionId")
-    subject = f"[Talend Alert] Valid failure for task {task_id}"
+def pick_store(settings: Settings) -> AlertStore:
+    if settings.azure_sql_connection_string:
+        logging.info("Using Azure SQL alert store.")
+        return AzureSqlAlertStore(settings.azure_sql_connection_string)
+    logging.info("Using SQLite fallback alert store at %s", settings.local_db_path)
+    return SqliteAlertStore(settings.local_db_path)
 
-    failed_components = []
-    for m in component_payload.get("metrics", {}).get("items", []):
-        if m.get("stacktrace"):
-            failed_components.append(f"- {m.get('connector_label', m.get('connector_id', 'unknown'))}")
 
-    body = (
-        f"Task ID: {task_id}\n"
-        f"Execution ID: {execution_id}\n"
-        f"Status: {execution.get('executionStatus')}\n"
-        f"Reason: {reason}\n"
-        f"Error: {execution.get('errorMessage', 'N/A')}\n"
-        f"Failed components:\n{chr(10).join(failed_components) if failed_components else '- none captured'}\n"
-        f"Start: {execution.get('startTimestamp')}\n"
-        f"Finish: {execution.get('finishTimestamp')}\n"
+def build_digest_html(digest_day: date, rows: List[Dict[str, Any]]) -> str:
+    header = (
+        "<h3>Talend Alert Noise Suppression - Daily Summary</h3>"
+        f"<p><b>Date (UTC):</b> {digest_day.isoformat()}<br/>"
+        f"<b>Total alerts:</b> {len(rows)}</p>"
     )
-    return subject, body
+    if not rows:
+        return header + "<p>No alerts recorded for this day.</p>"
+
+    table_head = (
+        "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse: collapse;'>"
+        "<tr>"
+        "<th>Time (UTC)</th><th>Type</th><th>Task</th><th>Status</th><th>Summary</th>"
+        "<th>Plan</th><th>Failed step</th><th>Downstream impact</th><th>Master impact</th>"
+        "</tr>"
+    )
+    rows_html = ""
+    for r in rows:
+        rows_html += (
+            "<tr>"
+            f"<td>{r.get('observed_at_utc','')}</td>"
+            f"<td>{r.get('execution_type','')}</td>"
+            f"<td>{r.get('task_id','')}</td>"
+            f"<td>{r.get('execution_status','')}</td>"
+            f"<td>{r.get('human_error','')}</td>"
+            f"<td>{r.get('plan_name','')}</td>"
+            f"<td>{r.get('failed_step_name','')}</td>"
+            f"<td>{r.get('downstream_summary','')}</td>"
+            f"<td>{r.get('master_summary','')}</td>"
+            "</tr>"
+        )
+    return header + table_head + rows_html + "</table>"
 
 
-def should_suppress_duplicate(task_state: Dict[str, Any], signature: str, now: datetime, suppress_min: int) -> bool:
-    if not task_state:
-        return False
-    if task_state.get("last_signature") != signature:
-        return False
-    alerted_at = _parse_dt(task_state.get("last_alerted_at"))
-    age_minutes = (now - alerted_at).total_seconds() / 60
-    return age_minutes < suppress_min
-
-
-@app.timer_trigger(schedule="0 */30 * * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False)
-def timer_trigger(myTimer: func.TimerRequest) -> None:
-    if myTimer.past_due:
-        logging.info("The timer is past due.")
+# ----------------------------
+# Trigger 1: Frequent polling/ingestion
+# ----------------------------
+@app.timer_trigger(schedule="%POLL_SCHEDULE%", arg_name="pollTimer", run_on_startup=False, use_monitor=True)
+def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
+    if pollTimer.past_due:
+        logging.info("Poll timer is past due.")
 
     settings = Settings()
-    recipients = load_recipients(settings.alert_recipients_file)
-    notifier = EmailNotifier(settings, recipients)
-    state_repo = StateStore(settings.state_file)
-    state = state_repo.load()
-    state.setdefault("tasks", {})
+    store = pick_store(settings)
+    store.init()
 
     client = TalendClient(settings)
-
     all_execs = client.get_task_executions()
     latest = get_latest_execution_by_task(all_execs)
 
@@ -305,48 +646,94 @@ def timer_trigger(myTimer: func.TimerRequest) -> None:
 
         execution_id = execution.get("executionId")
         if not execution_id:
-            logging.warning("Task %s has failed state without executionId; skipping.", task_id)
+            continue
+
+        alert_key = execution_id  # unique per Talend run; avoids duplicate inserts across poll cycles
+        if store.exists_alert_key(alert_key):
             continue
 
         component_payload = client.get_component_metrics(execution_id)
         decision, reason = classify_failure(execution, component_payload)
-        signature = f"{execution_status}|{execution.get('errorMessage', '')[:180]}"
-        task_state = state["tasks"].get(task_id, {})
 
-        if should_suppress_duplicate(task_state, signature, now, settings.duplicate_suppress_minutes):
-            logging.info("Suppressed duplicate alert for task %s.", task_id)
-            continue
+        # Retry only for transient MANUAL task runs.
+        if (
+            execution.get("executionType") == "MANUAL"
+            and decision == "retryable_noise"
+            and settings.retry_enabled
+        ):
+            retry_count = 0
+            while retry_count < settings.retry_max_attempts:
+                retry_count += 1
+                try:
+                    new_execution_id = client.retry_task(task_id)
+                    logging.info(
+                        "Retried task %s due to transient issue. prior=%s new=%s",
+                        task_id,
+                        execution_id,
+                        new_execution_id,
+                    )
+                    break
+                except Exception:
+                    logging.exception("Retry attempt %d failed for task %s", retry_count, task_id)
 
-        if decision == "retryable_noise" and settings.retry_enabled:
-            attempts = int(task_state.get("retry_attempts", 0))
-            if attempts < settings.retry_max_attempts:
-                new_execution_id = client.retry_task(task_id)
-                logging.info(
-                    "Retried task %s for execution %s, new executionId=%s",
-                    task_id,
-                    execution_id,
-                    new_execution_id,
-                )
-                state["tasks"][task_id] = {
-                    "last_signature": signature,
-                    "last_decision": decision,
-                    "last_retry_at": now.isoformat(),
-                    "retry_attempts": attempts + 1,
-                    "last_execution_id": execution_id,
-                }
-                continue
+        plan_context: Dict[str, str] = {}
+        if execution.get("executionType") == "PLAN" and execution.get("planId"):
+            try:
+                plan_context = enrich_plan_context(client, execution)
+            except Exception:
+                logging.exception("Failed to enrich plan context for execution %s", execution_id)
 
-            logging.info("Retry skipped for task %s because retry_max_attempts reached.", task_id)
+        master_summary = parse_master_job_dependency(component_payload)
+        human_error = summarize_error(execution.get("errorMessage", ""), component_payload)
 
-        subject, body = compose_alert(execution, reason, component_payload)
-        notifier.send(subject, body)
-        state["tasks"][task_id] = {
-            "last_signature": signature,
-            "last_decision": decision,
-            "last_alerted_at": now.isoformat(),
-            "retry_attempts": 0,
-            "last_execution_id": execution_id,
+        row = {
+            "alert_key": alert_key,
+            "observed_at_utc": now.isoformat(),
+            "day_utc": now.date().isoformat(),
+            "execution_id": execution_id,
+            "task_id": task_id,
+            "execution_type": execution.get("executionType", ""),
+            "execution_status": execution_status,
+            "plan_id": plan_context.get("plan_id", execution.get("planId", "")),
+            "plan_execution_id": plan_context.get("plan_execution_id", ""),
+            "plan_name": plan_context.get("plan_name", ""),
+            "failed_step_id": plan_context.get("failed_step_id", ""),
+            "failed_step_name": plan_context.get("failed_step_name", ""),
+            "downstream_summary": plan_context.get("downstream_summary", ""),
+            "master_summary": master_summary,
+            "decision": decision,
+            "human_error": human_error,
+            "raw_error": execution.get("errorMessage", "") + " | " + reason,
         }
+        store.insert_alert(row)
 
-    state_repo.save(state)
-    logging.info("Alert Noise Suppression run finished. Checked %d latest task executions.", len(latest))
+    logging.info("Polling completed. Scanned latest executions for %d tasks.", len(latest))
+
+
+# ----------------------------
+# Trigger 2: Daily summary email
+# ----------------------------
+@app.timer_trigger(schedule="%DIGEST_SCHEDULE%", arg_name="digestTimer", run_on_startup=False, use_monitor=True)
+def send_daily_digest(digestTimer: func.TimerRequest) -> None:
+    if digestTimer.past_due:
+        logging.info("Digest timer is past due.")
+
+    settings = Settings()
+    store = pick_store(settings)
+    store.init()
+
+    recipients = load_recipients(settings.alert_recipients_file)
+    notifier = EmailNotifier(settings, recipients)
+    if not notifier.is_enabled():
+        logging.warning("Email notifier not configured. Digest skipped.")
+        return
+
+    digest_day = datetime.now(timezone.utc).date() - timedelta(days=1)
+    rows = store.get_digest_rows(digest_day)
+    body = build_digest_html(digest_day, rows)
+    subject = f"Talend Daily Alert Summary - {digest_day.isoformat()}"
+    notifier.send(subject, body)
+
+    ids = [r["id"] for r in rows if r.get("id") is not None]
+    store.mark_emailed(ids)
+    logging.info("Digest sent for %s with %d row(s).", digest_day.isoformat(), len(rows))
