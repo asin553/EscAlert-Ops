@@ -30,6 +30,8 @@ class Settings:
     lookback_limit: int = int(os.getenv("TALEND_TASK_EXECUTIONS_LIMIT", "100"))
     plan_lookback_limit: int = int(os.getenv("TALEND_PLAN_EXECUTIONS_LIMIT", "100"))
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
+    talend_workspace_id: str = os.getenv("TALEND_WORKSPACE_ID", "")
+    talend_environment_id: str = os.getenv("TALEND_ENVIRONMENT_ID", "")
 
     alert_recipients_file: str = os.getenv("ALERT_RECIPIENTS_FILE", "alert_recipients.json")
     local_db_path: str = os.getenv("LOCAL_ALERT_DB", "/tmp/ans_alerts.db")
@@ -112,7 +114,11 @@ class TalendClient:
         return f"{self.settings.api_base_url}{endpoint}"
 
     def get_task_executions(self) -> List[Dict[str, Any]]:
-        params = {"limit": self.settings.lookback_limit, "offset": 0}
+        params: Dict[str, Any] = {"limit": self.settings.lookback_limit, "offset": 0}
+        if self.settings.talend_workspace_id:
+            params["workspaceId"] = self.settings.talend_workspace_id
+        if self.settings.talend_environment_id:
+            params["environmentId"] = self.settings.talend_environment_id
         resp = self.session.get(
             self._url(self.settings.task_executions_endpoint),
             params=params,
@@ -148,7 +154,11 @@ class TalendClient:
         return resp.json().get("executionId")
 
     def get_plan_executions(self) -> List[Dict[str, Any]]:
-        params = {"limit": self.settings.plan_lookback_limit, "offset": 0}
+        params: Dict[str, Any] = {"limit": self.settings.plan_lookback_limit, "offset": 0}
+        if self.settings.talend_workspace_id:
+            params["workspaceId"] = self.settings.talend_workspace_id
+        if self.settings.talend_environment_id:
+            params["environmentId"] = self.settings.talend_environment_id
         resp = self.session.get(
             self._url(self.settings.plan_executions_endpoint),
             params=params,
