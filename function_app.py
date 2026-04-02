@@ -39,6 +39,7 @@ class Settings:
     retry_max_attempts: int = int(os.getenv("RETRY_MAX_ATTEMPTS", "1"))
     plan_retry_enabled: bool = _env_bool("PLAN_RETRY_ENABLED", True)
     plan_retry_max_attempts: int = int(os.getenv("PLAN_RETRY_MAX_ATTEMPTS", "1"))
+    store_retryable_noise: bool = _env_bool("STORE_RETRYABLE_NOISE", False)
 
     smtp_host: str = os.getenv("SMTP_HOST", "")
     smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
@@ -209,6 +210,7 @@ class SqliteAlertStore(AlertStore):
                     day_utc TEXT NOT NULL,
                     execution_id TEXT NOT NULL,
                     task_id TEXT,
+                    task_name TEXT,
                     execution_type TEXT,
                     execution_status TEXT,
                     plan_id TEXT,
@@ -219,6 +221,7 @@ class SqliteAlertStore(AlertStore):
                     downstream_summary TEXT,
                     master_summary TEXT,
                     decision TEXT,
+                    include_in_digest INTEGER DEFAULT 1,
                     human_error TEXT,
                     raw_error TEXT,
                     email_sent INTEGER DEFAULT 0,
@@ -226,6 +229,15 @@ class SqliteAlertStore(AlertStore):
                 )
                 """
             )
+            # Lightweight schema migration for existing DB files.
+            for ddl in [
+                "ALTER TABLE alerts ADD COLUMN task_name TEXT",
+                "ALTER TABLE alerts ADD COLUMN include_in_digest INTEGER DEFAULT 1",
+            ]:
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
 
     def exists_alert_key(self, alert_key: str) -> bool:
         with self._conn() as conn:
@@ -237,10 +249,10 @@ class SqliteAlertStore(AlertStore):
             conn.execute(
                 """
                 INSERT INTO alerts (
-                    alert_key, observed_at_utc, day_utc, execution_id, task_id, execution_type, execution_status,
+                    alert_key, observed_at_utc, day_utc, execution_id, task_id, task_name, execution_type, execution_status,
                     plan_id, plan_execution_id, plan_name, failed_step_id, failed_step_name,
-                    downstream_summary, master_summary, decision, human_error, raw_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    downstream_summary, master_summary, decision, include_in_digest, human_error, raw_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["alert_key"],
@@ -248,6 +260,7 @@ class SqliteAlertStore(AlertStore):
                     row["day_utc"],
                     row["execution_id"],
                     row.get("task_id"),
+                    row.get("task_name"),
                     row.get("execution_type"),
                     row.get("execution_status"),
                     row.get("plan_id"),
@@ -258,6 +271,7 @@ class SqliteAlertStore(AlertStore):
                     row.get("downstream_summary"),
                     row.get("master_summary"),
                     row.get("decision"),
+                    row.get("include_in_digest", 1),
                     row.get("human_error"),
                     row.get("raw_error"),
                 ),
@@ -269,7 +283,7 @@ class SqliteAlertStore(AlertStore):
                 """
                 SELECT *
                 FROM alerts
-                WHERE day_utc = ? AND email_sent = 0
+                WHERE day_utc = ? AND email_sent = 0 AND include_in_digest = 1
                 ORDER BY observed_at_utc ASC
                 """,
                 (digest_day.isoformat(),),
@@ -310,6 +324,7 @@ class AzureSqlAlertStore(AlertStore):
             day_utc NVARCHAR(32) NOT NULL,
             execution_id NVARCHAR(128) NOT NULL,
             task_id NVARCHAR(128),
+            task_name NVARCHAR(256),
             execution_type NVARCHAR(64),
             execution_status NVARCHAR(64),
             plan_id NVARCHAR(128),
@@ -320,6 +335,7 @@ class AzureSqlAlertStore(AlertStore):
             downstream_summary NVARCHAR(MAX),
             master_summary NVARCHAR(MAX),
             decision NVARCHAR(64),
+            include_in_digest BIT DEFAULT 1,
             human_error NVARCHAR(512),
             raw_error NVARCHAR(MAX),
             email_sent BIT DEFAULT 0,
@@ -327,7 +343,12 @@ class AzureSqlAlertStore(AlertStore):
         )
         """
         with self._conn() as conn:
-            conn.cursor().execute(ddl)
+            cur = conn.cursor()
+            cur.execute(ddl)
+            cur.execute("IF COL_LENGTH('alerts','task_name') IS NULL ALTER TABLE alerts ADD task_name NVARCHAR(256)")
+            cur.execute(
+                "IF COL_LENGTH('alerts','include_in_digest') IS NULL ALTER TABLE alerts ADD include_in_digest BIT DEFAULT 1"
+            )
             conn.commit()
 
     def exists_alert_key(self, alert_key: str) -> bool:
@@ -337,10 +358,10 @@ class AzureSqlAlertStore(AlertStore):
 
     def insert_alert(self, row: Dict[str, Any]) -> None:
         fields = [
-            "alert_key", "observed_at_utc", "day_utc", "execution_id", "task_id", "execution_type",
-            "execution_status", "plan_id", "plan_execution_id", "plan_name", "failed_step_id",
-            "failed_step_name", "downstream_summary", "master_summary", "decision", "human_error",
-            "raw_error",
+            "alert_key", "observed_at_utc", "day_utc", "execution_id", "task_id", "task_name",
+            "execution_type", "execution_status", "plan_id", "plan_execution_id", "plan_name",
+            "failed_step_id", "failed_step_name", "downstream_summary", "master_summary", "decision",
+            "include_in_digest", "human_error", "raw_error",
         ]
         values = [row.get(f) for f in fields]
         placeholders = ",".join("?" for _ in values)
@@ -353,7 +374,7 @@ class AzureSqlAlertStore(AlertStore):
         with self._conn() as conn:
             cur = conn.cursor()
             rows = cur.execute(
-                "SELECT * FROM alerts WHERE day_utc = ? AND email_sent = 0 ORDER BY observed_at_utc ASC",
+                "SELECT * FROM alerts WHERE day_utc = ? AND email_sent = 0 AND include_in_digest = 1 ORDER BY observed_at_utc ASC",
                 digest_day.isoformat(),
             ).fetchall()
             columns = [c[0] for c in cur.description]
@@ -633,6 +654,9 @@ def flatten_plan_steps(chart_node: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "id": step_id,
                     "name": current.get("name", step_id),
                     "flows": flow_names,
+                    "flow_ids": [
+                        f.get("id") for f in flows if isinstance(f, dict) and f.get("id")
+                    ],
                 }
             )
         current = current.get("nextStep") if isinstance(current.get("nextStep"), dict) else None
@@ -668,13 +692,19 @@ def enrich_plan_context(
 
     failed_step_id = failed_step.get("id") if failed_step else ""
     failed_step_name = step_name_map.get(failed_step_id, failed_step_id) if failed_step_id else ""
+    step_tasks_map: Dict[str, str] = {}
+    for s in ordered_steps:
+        task_list = [name for name in s.get("flows", []) if name]
+        step_tasks_map[s["id"]] = ", ".join(task_list)
 
     downstream: List[str] = []
+    downstream_tasks: List[str] = []
     if failed_step_id:
         ids = [s["id"] for s in ordered_steps]
         if failed_step_id in ids:
             idx = ids.index(failed_step_id)
             downstream = [step_name_map.get(step_id, step_id) for step_id in ids[idx + 1 :]]
+            downstream_tasks = [step_tasks_map.get(step_id, "") for step_id in ids[idx + 1 :]]
 
     return {
         "plan_id": plan_id,
@@ -683,7 +713,9 @@ def enrich_plan_context(
         "plan_executable": plan_executable,
         "failed_step_id": failed_step_id,
         "failed_step_name": failed_step_name,
+        "failed_step_tasks": step_tasks_map.get(failed_step_id, ""),
         "downstream_summary": ", ".join(downstream) if downstream else "",
+        "downstream_tasks": " | ".join([x for x in downstream_tasks if x]),
     }
 
 
@@ -696,12 +728,55 @@ def load_recipients(path: str) -> List[str]:
     return [r for r in data.get("emails", []) if isinstance(r, str) and r.strip()]
 
 
+def plan_dependency_summary(plan_context: Dict[str, str]) -> str:
+    failed_step = plan_context.get("failed_step_name", "")
+    failed_tasks = plan_context.get("failed_step_tasks", "")
+    downstream_steps = plan_context.get("downstream_summary", "")
+    downstream_tasks = plan_context.get("downstream_tasks", "")
+    if not failed_step and not downstream_steps:
+        return ""
+
+    chunks = []
+    if failed_step:
+        if failed_tasks:
+            chunks.append(f"Plan failure at step '{failed_step}' (task(s): {failed_tasks})")
+        else:
+            chunks.append(f"Plan failure at step '{failed_step}'")
+    if downstream_steps:
+        chunks.append(f"Downstream steps not completed: {downstream_steps}")
+    if downstream_tasks:
+        chunks.append(f"Downstream task(s) impacted: {downstream_tasks}")
+    return "; ".join(chunks)
+
+
 def pick_store(settings: Settings) -> AlertStore:
     if settings.azure_sql_connection_string:
         logging.info("Using Azure SQL alert store.")
         return AzureSqlAlertStore(settings.azure_sql_connection_string)
     logging.info("Using SQLite fallback alert store at %s", settings.local_db_path)
     return SqliteAlertStore(settings.local_db_path)
+
+
+def init_store_with_fallback(settings: Settings) -> AlertStore:
+    """
+    Initializes the preferred store and falls back to SQLite when Azure SQL
+    driver/connection settings are unavailable at runtime.
+    """
+    preferred = pick_store(settings)
+    try:
+        preferred.init()
+        return preferred
+    except Exception:
+        if isinstance(preferred, AzureSqlAlertStore):
+            logging.exception(
+                "Azure SQL initialization failed (driver/connection issue). "
+                "Falling back to SQLite at %s",
+                settings.local_db_path,
+            )
+            fallback = SqliteAlertStore(settings.local_db_path)
+            fallback.init()
+            return fallback
+        raise
 
 
 def build_digest_html(digest_day: date, rows: List[Dict[str, Any]]) -> str:
@@ -716,7 +791,7 @@ def build_digest_html(digest_day: date, rows: List[Dict[str, Any]]) -> str:
     table_head = (
         "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse: collapse;'>"
         "<tr>"
-        "<th>Time (UTC)</th><th>Type</th><th>Task</th><th>Status</th><th>Summary</th>"
+        "<th>Time (UTC)</th><th>Type</th><th>Task ID</th><th>Task Name</th><th>Status</th><th>Summary</th>"
         "<th>Plan</th><th>Failed step</th><th>Downstream impact</th><th>Master impact</th>"
         "</tr>"
     )
@@ -727,6 +802,7 @@ def build_digest_html(digest_day: date, rows: List[Dict[str, Any]]) -> str:
             f"<td>{r.get('observed_at_utc','')}</td>"
             f"<td>{r.get('execution_type','')}</td>"
             f"<td>{r.get('task_id','')}</td>"
+            f"<td>{r.get('task_name','')}</td>"
             f"<td>{r.get('execution_status','')}</td>"
             f"<td>{r.get('human_error','')}</td>"
             f"<td>{r.get('plan_name','')}</td>"
@@ -747,8 +823,7 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
         logging.info("Poll timer is past due.")
 
     settings = Settings()
-    store = pick_store(settings)
-    store.init()
+    store = init_store_with_fallback(settings)
     ai_summarizer = OpenAIErrorSummarizer(settings)
 
     client = TalendClient(settings)
@@ -825,6 +900,8 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
                             )
 
         master_summary = parse_master_job_dependency(component_payload)
+        if execution.get("executionType") == "PLAN":
+            master_summary = plan_dependency_summary(plan_context) or master_summary
         human_error = summarize_error(
             execution.get("errorMessage", ""),
             component_payload,
@@ -833,12 +910,17 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
             ai_mode=settings.ai_summarization_mode,
         )
 
+        include_in_digest = 1 if decision == "valid_failure" else 0
+        if decision == "retryable_noise" and not settings.store_retryable_noise:
+            continue
+
         row = {
             "alert_key": alert_key,
             "observed_at_utc": now.isoformat(),
             "day_utc": now.date().isoformat(),
             "execution_id": execution_id,
             "task_id": task_id,
+            "task_name": component_payload.get("artifact_name", ""),
             "execution_type": execution.get("executionType", ""),
             "execution_status": execution_status,
             "plan_id": plan_context.get("plan_id", execution.get("planId", "")),
@@ -849,6 +931,7 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
             "downstream_summary": plan_context.get("downstream_summary", ""),
             "master_summary": master_summary,
             "decision": decision,
+            "include_in_digest": include_in_digest,
             "human_error": human_error,
             "raw_error": execution.get("errorMessage", "") + " | " + reason,
         }
@@ -866,8 +949,7 @@ def send_daily_digest(digestTimer: func.TimerRequest) -> None:
         logging.info("Digest timer is past due.")
 
     settings = Settings()
-    store = pick_store(settings)
-    store.init()
+    store = init_store_with_fallback(settings)
 
     recipients = load_recipients(settings.alert_recipients_file)
     notifier = EmailNotifier(settings, recipients)
