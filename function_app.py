@@ -741,7 +741,7 @@ def build_digest_html(digest_day: date, rows: List[Dict[str, Any]]) -> str:
 # ----------------------------
 # Trigger 1: Frequent polling/ingestion
 # ----------------------------
-@app.timer_trigger(schedule="%POLL_SCHEDULE%", arg_name="pollTimer", run_on_startup=False, use_monitor=True)
+@app.timer_trigger(schedule="0 */5 * * * *", arg_name="pollTimer", run_on_startup=False, use_monitor=True)
 def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
     if pollTimer.past_due:
         logging.info("Poll timer is past due.")
@@ -860,7 +860,7 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
 # ----------------------------
 # Trigger 2: Daily summary email
 # ----------------------------
-@app.timer_trigger(schedule="%DIGEST_SCHEDULE%", arg_name="digestTimer", run_on_startup=False, use_monitor=True)
+@app.timer_trigger(schedule="0 12 0 * * *", arg_name="digestTimer", run_on_startup=False, use_monitor=True)
 def send_daily_digest(digestTimer: func.TimerRequest) -> None:
     if digestTimer.past_due:
         logging.info("Digest timer is past due.")
