@@ -943,7 +943,7 @@ def poll_talend_alerts(pollTimer: func.TimerRequest) -> None:
 # ----------------------------
 # Trigger 2: Daily summary email
 # ----------------------------
-@app.timer_trigger(schedule="0 18 0 * * *", arg_name="digestTimer", run_on_startup=False, use_monitor=True)
+@app.timer_trigger(schedule="0 5 18 * * *", arg_name="digestTimer", run_on_startup=False, use_monitor=True)
 def send_daily_digest(digestTimer: func.TimerRequest) -> None:
     if digestTimer.past_due:
         logging.info("Digest timer is past due.")
