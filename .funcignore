@@ -1,5 +1,7 @@
 .git*
 .vscode
+.codex
+AGENTS.md
 __azurite_db*__.json
 __blobstorage__
 __queuestorage__
