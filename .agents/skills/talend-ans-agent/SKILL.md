@@ -23,6 +23,34 @@ Use this skill when modifying the Talend Alert Noise Suppression source code in 
 - Decision helpers: retry/noise classification, rule-based summaries, master-job dependency parsing, plan dependency parsing.
 - Timer triggers: `poll_talend_alerts` and `send_daily_digest`.
 
+## Endpoint Flow To Preserve
+
+Shared polling starts with `GET /processing/executables/tasks/executions`. Read response `items`, group by `taskId`, and keep the latest run using `finishTimestamp`, `startTimestamp`, then `triggerTimestamp`.
+
+For every latest failed execution, call `GET /monitoring/observability/executions/{executionId}/component`.
+
+For `MANUAL` task failures:
+
+1. Use `taskId`, `executionId`, `executionStatus`, `executionType`, `errorMessage`, and component metrics to classify the failure.
+2. Retry only transient network/engine/platform failures with `POST /processing/executions` and payload `{"executable": "<taskId>", "logLevel": "WARN"}`.
+3. Treat data, component, permission, syntax, and ambiguous failures as valid alerts.
+
+For `MANUAL` Master Jobs:
+
+1. Detect child jobs from component metrics where `connector_type == "tRunJob"`.
+2. Order children by numeric suffix in `connector_id`, such as `tRunJob_1` before `tRunJob_2`.
+3. Use the first `tRunJob` with a stack trace as the failed child.
+4. Report later `tRunJob` components as downstream jobs that should not be expected to run.
+
+For `PLAN` failures, enrich context in this exact order:
+
+1. `GET /monitoring/observability/executions/{executionId}/component`
+2. `GET /processing/executables/plans/executions`, matching by `planId` to find `planExecutionId`
+3. `GET /processing/executions/plans/{planExecutionId}/steps`, extracting failed step IDs/status
+4. `GET /orchestration/executables/plans/{planId}`, extracting plan `name`, plan `executable`, step names, task names, `chart`, `nextStep`, and `flows`
+
+For retryable plan failures, call `POST /processing/executions/plans` with payload `{"executable": "<plan executable>"}` where the executable comes from `/orchestration/executables/plans/{planId}`.
+
 ## Change Checklist
 
 - Keep new settings in `Settings` with safe defaults.
