@@ -6,7 +6,8 @@ The application is built as a Python Azure Functions app with timer triggers. It
 
 ## Serverless Architecture
 
-<img width="3316" height="1952" alt="image" src="https://github.com/user-attachments/assets/1d7042eb-40af-4bae-987c-104cbeecdba1" />
+<img width="1628" height="972" alt="image" src="https://github.com/user-attachments/assets/089361dd-70e4-40f3-ba81-761446cc278b" />
+
 
 The Azure resources are deployed under a Subscription and Resource Group. The Function App is the compute layer; the Storage Account supports Azure Functions runtime requirements; Azure SQL stores alert and digest state; Talend Cloud APIs provide execution context and retry operations; the OpenAI layer enriches valid failures with concise summaries; SMTP delivers the final digest to configured recipients.
 
