@@ -4,6 +4,34 @@ This project implements an AI-assisted Alert Noise Suppression (ANS) and defect 
 
 The application is built as a Python Azure Functions app with timer triggers. It uses Talend APIs as external operational tools, optional OpenAI LLM summarization, local or Azure SQL alert persistence, and SMTP-based daily digest delivery.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    timer["Timer Trigger<br/>Every 10 minutes / Daily digest"]
+
+    subgraph sub["Azure Subscription"]
+        subgraph rg["Resource Group"]
+            func["Azure Function App<br/>Python ANS Agent"]
+            storage["Storage Account<br/>Function runtime state"]
+            sql["Azure SQL Database<br/>Alert history and digest state"]
+        end
+    end
+
+    talend["Talend Cloud / TMC APIs<br/>Task runs, plan runs, components, retries"]
+    openai["OpenAI LLM<br/>Failure summarization"]
+    email["SMTP / Email<br/>Daily alert digest"]
+
+    timer --> func
+    func <--> talend
+    func --> openai
+    func <--> sql
+    func <--> storage
+    func --> email
+```
+
+The Azure resources are deployed under a Subscription and Resource Group. The Function App is the compute layer; the Storage Account supports Azure Functions runtime requirements; Azure SQL stores alert and digest state; Talend Cloud APIs provide execution context and retry operations; the OpenAI layer enriches valid failures with concise summaries; SMTP delivers the final digest to configured recipients.
+
 ## What This Agent Does
 
 - Polls recent Talend task and plan executions on a schedule.
