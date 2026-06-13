@@ -1,4 +1,4 @@
-# Talend Alert Noise Suppression Agent
+# EscAlert Ops (Escalate Alert Operations)
 
 This project implements an AI-assisted Alert Noise Suppression (ANS) and defect triage agent for Talend Cloud / Talend Management Console (TMC). Talend does not provide a public, native ANS workflow for automatically separating transient platform noise from valid job failures, so this agent adds that operational layer by polling Talend APIs, inspecting execution context, classifying failures, retrying safe transient failures, and summarizing actionable incidents for escalation.
 
